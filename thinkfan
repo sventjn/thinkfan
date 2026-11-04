@@ -1,0 +1,838 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  thinkfan 1.0.0: ThinkPad fan, thermal monitoring and guard
+# ============================================================================
+#  What it does:
+#    * Fan: auto | level 1..7 | disengaged (full speed)
+#    * Temperatures: CPU (k10temp/coretemp), GPU (amdgpu/nvidia-smi),
+#      NVMe, battery, ACPI zones and the ThinkPad EC (/proc/acpi/ibm/thermal)
+#    * --status   : snapshot
+#    * --watch    : live view
+#    * --check    : one measurement, exit code 0/1/2 (ok/warm/critical)
+#    * --probe    : shows which sensors and fan interfaces were found
+#    * --guard    : long running guard with countermeasures:
+#                     raise the fan level, cap the CPU clock, disable turbo,
+#                     renice CPU hogs (optionally SIGTERM), notify, log,
+#                     and roll everything back once it cools down.
+#
+#  Without a password: every privileged write goes through
+#  /usr/local/sbin/thinkfan-root (see sudoers.d/thinkfan). Install with:
+#      sudo ./install-thinkfan.sh
+#  If the guard runs as a systemd system service (root), it needs no sudo.
+# ============================================================================
+set -uo pipefail
+
+PROG=${0##*/}
+VERSION="1.0.0"
+
+FAN_PROC=${FAN_PROC:-/proc/acpi/ibm/fan}
+TP_THERMAL=${TP_THERMAL:-/proc/acpi/ibm/thermal}
+SYS_CPU=${SYS_CPU:-/sys/devices/system/cpu}
+HELPER=${THINKFAN_ROOT_HELPER:-/usr/local/sbin/thinkfan-root}
+SYS_CONF=${THINKFAN_SYS_CONF:-/etc/thinkfan/thinkfan.conf}
+USR_CONF=${THINKFAN_USR_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/thinkfan/thinkfan.conf}
+
+# ---------------------------------------------------------------- Defaults --
+POLL=5
+WARN_CPU=80;   CRIT_CPU=92
+WARN_GPU=80;   CRIT_GPU=92
+WARN_NVME=70;  CRIT_NVME=82
+WARN_BAT=45;   CRIT_BAT=55
+WARN_ACPI=70;  CRIT_ACPI=85
+WARN_EC=80;    CRIT_EC=92
+WARN_OTHER=80; CRIT_OTHER=90
+EC_IN_DECISIONS=0
+FAN_LEVEL_WARN=5
+FAN_LEVEL_CRIT=7
+FAN_DISENGAGE_ON_CRIT=0
+FAN_RESTORE_ON_EXIT=1
+CPU_CAP_PCT_WARN=90
+CPU_CAP_PCT_CRIT=65
+CPU_BOOST_CRIT=1
+CPU_GOVERNOR_CRIT=""
+RENICE_ENABLED=1
+RENICE_MIN_CPU=50
+RENICE_NICE=19
+KILL_ENABLED=0
+KILL_MIN_CPU=70
+KILL_AFTER_SAMPLES=6
+PROC_WHITELIST='^(systemd|systemd-.*|init|kthreadd|kworker.*|ksoftirqd.*|migration.*|rcu.*|Xorg|Xwayland|sshd|dbus-daemon|dbus-broker|pipewire.*|wireplumber|gnome-shell|kwin_.*|plasmashell|xfwm4|xfsettingsd|compositor|thinkfan|python3?)$'
+HYSTERESIS=4
+RECOVER_SAMPLES=6
+MIN_ESCALATE_INTERVAL=20
+NOTIFY_CMD=""
+NOTIFY_DESKTOP=0
+LOG_MAX_LINES=10000
+
+DRY_RUN=0
+FAKE=""
+# ---------------------------------------------------------------------------
+
+# ------------------------------------------------------------- Small stuff --
+c_reset=""; c_bold=""; c_red=""; c_yel=""; c_grn=""; c_dim=""
+setup_colors() {
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+        c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_red=$'\033[31m'
+        c_yel=$'\033[33m'; c_grn=$'\033[32m'; c_dim=$'\033[2m'
+    fi
+}
+
+now_iso() { date -Is; }
+now_epoch() { date +%s; }
+
+msg() { printf '%s\n' "$*" >&2; }
+
+load_config() {
+    local f mode
+    for f in "$SYS_CONF" "$USR_CONF"; do
+        [ -r "$f" ] || continue
+        mode=$(stat -c %a "$f" 2>/dev/null || echo 644)
+        if [ "$(stat -c %u "$f" 2>/dev/null || echo 1)" != "0" ] &&
+            [ "$(stat -c %u "$f" 2>/dev/null || echo 1)" != "$(id -u)" ]; then
+            msg "$PROG: $f belongs to neither root nor me, ignoring it"
+            continue
+        fi
+        if ((8#$mode & 022)); then
+            msg "$PROG: $f is group/world writable, ignoring it (security)"
+            continue
+        fi
+        # shellcheck source=/dev/null
+        . "$f"
+    done
+}
+
+resolve_state_dir() {
+    if [ -n "${STATE_DIR:-}" ]; then
+        STATE_DIR=${STATE_DIR/#\~/$HOME}
+    elif [ "$(id -u)" -eq 0 ]; then
+        STATE_DIR=/var/lib/thinkfan
+    else
+        STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/thinkfan
+    fi
+    LOG_FILE=${LOG_FILE:-$STATE_DIR/thinkfan.log}
+    STATE_FILE=$STATE_DIR/state.json
+    CPU_DEPTH_FILE=$STATE_DIR/cpu-max.orig
+    RENICE_FILE=$STATE_DIR/reniced
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+}
+
+log() { # $1 = INFO|WARN|CRIT, rest = message
+    local lvl=$1; shift
+    local line
+    line="$(now_iso) [$lvl] $*"
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '%sDRY%s %s\n' "$c_dim" "$c_reset" "$line" >&2
+        return 0
+    fi
+    printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+    case "$lvl" in
+    CRIT) printf '%s[%s]%s %s\n' "$c_red" "$lvl" "$c_reset" "$*" >&2 ;;
+    WARN) printf '%s[%s]%s %s\n' "$c_yel" "$lvl" "$c_reset" "$*" >&2 ;;
+    esac
+    trim_log
+}
+
+trim_log() {
+    local n
+    [ -r "$LOG_FILE" ] || return 0
+    n=$(wc -l <"$LOG_FILE" 2>/dev/null) || return 0
+    if [ "${n:-0}" -gt "$LOG_MAX_LINES" ]; then
+        tail -n $((LOG_MAX_LINES / 2)) "$LOG_FILE" >"$LOG_FILE.tmp" 2>/dev/null &&
+            mv "$LOG_FILE.tmp" "$LOG_FILE"
+    fi
+}
+
+# ----------------------------------------------- privileged actions ---------
+_priv() {
+    if [ "$DRY_RUN" = 1 ]; then
+        log INFO "DRY-RUN: would run: $HELPER $*"
+        return 0
+    fi
+    if [ ! -x "$HELPER" ]; then
+        log WARN "root helper $HELPER is missing, '$1' not possible (sudo ./install-thinkfan.sh)"
+        return 127
+    fi
+    if [ "$(id -u)" -eq 0 ]; then
+        "$HELPER" "$@" 2>&1 | sed 's/^/  /' >&2
+        return "${PIPESTATUS[0]}"
+    fi
+    local out rc
+    out=$(sudo -n "$HELPER" "$@" 2>&1); rc=$?
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /' >&2
+    if [ "$rc" -ne 0 ]; then
+        log WARN "action '$*' needs privileges (sudo -n failed): $out"
+    fi
+    return "$rc"
+}
+
+# -------------------------------------------------------------------- fan ---
+fan_available() { [ -r "$FAN_PROC" ]; }
+fan_field() { awk -v k="$1" '$1==k":"{print $2; exit}' "$FAN_PROC" 2>/dev/null; }
+fan_write_possible() { grep -q '^commands:' "$FAN_PROC" 2>/dev/null; }
+
+set_fan() { # auto|full|disengaged|1..7
+    local lvl=$1
+    case "$lvl" in full) lvl=disengaged ;; esac
+    if ! fan_available; then
+        log WARN "fan control not available ($FAN_PROC missing), step skipped"
+        return 1
+    fi
+    if ! fan_write_possible && [ "$DRY_RUN" != 1 ]; then
+        log WARN "fan_control=1 missing (modprobe.d/thinkpad_acpi.conf), cannot write"
+        return 1
+    fi
+    if _priv fan "$lvl"; then
+        log INFO "fan -> $lvl"
+        return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------- sensors ---
+sensor_role() { # $1 hwmon name, $2 label, $3 path
+    local n=${1,,} l=${2,,} p=${3:-}
+    case "$n" in
+    *k10temp* | *coretemp* | *zenpower* | *cpu_thermal* | *soc_thermal*) echo cpu; return ;;
+    *amdgpu* | *radeon* | *nouveau* | *nvidia*) echo gpu; return ;;
+    *nvme*) echo nvme; return ;;
+    *thinkpad*) echo ec; return ;;
+    *battery*) echo bat; return ;;
+    esac
+    case "$p" in
+    *nvme*) echo nvme; return ;;
+    *amdgpu* | */drm/*) echo gpu; return ;;
+    */power_supply/*) echo bat; return ;;
+    esac
+    case "$l" in
+    tctl | tdie | package* | core*) echo cpu; return ;;
+    edge | junction | mem | vram*) echo gpu; return ;;
+    composite*) echo nvme; return ;;
+    esac
+    case "$n" in
+    *acpi* | *pkg_temp*) echo acpi; return ;;
+    esac
+    echo other
+}
+
+sensor_lines() { # role|name|milli°C
+    local h hname lbl f v t z zt zb i vals
+    for h in /sys/class/hwmon/hwmon*; do
+        [ -d "$h" ] || continue
+        hname=$(cat "$h/name" 2>/dev/null) || hname=""
+        for f in "$h"/temp*_input; do
+            [ -r "$f" ] || continue
+            v=$(cat "$f" 2>/dev/null) || continue
+            [[ $v =~ ^-?[0-9]+$ ]] || continue
+            ((v > 1000 && v < 150000)) || continue
+            lbl=""
+            [ -r "${f%_input}_label" ] && lbl=$(cat "${f%_input}_label" 2>/dev/null)
+            printf '%s|%s|%s\n' "$(sensor_role "$hname" "$lbl" "$(readlink -f "$h" 2>/dev/null)")" \
+                "${hname:-hwmon}${lbl:+ $lbl}" "$v"
+        done
+    done
+    # ACPI thermal zones
+    for z in /sys/class/thermal/thermal_zone*; do
+        [ -r "$z/temp" ] || continue
+        t=$(cat "$z/temp" 2>/dev/null) || continue
+        [[ $t =~ ^-?[0-9]+$ ]] || continue
+        ((t > 1000 && t < 150000)) || continue
+        zt=$(cat "$z/type" 2>/dev/null) || zt=thermal
+        zb=$(basename "$z")
+        printf '%s|%s|%s\n' "$(sensor_role "$zt" "" "")" "thermal $zt ($zb)" "$t"
+    done
+    # Battery (value in tenths of a degree)
+    for b in /sys/class/power_supply/BAT* /sys/class/power_supply/*battery*; do
+        [ -r "$b/temp" ] || continue
+        v=$(cat "$b/temp" 2>/dev/null) || continue
+        [[ $v =~ ^-?[0-9]+$ ]] || continue
+        ((v > 0 && v < 1000)) || continue
+        printf 'bat|%s|%s\n' "$(basename "$b")" "$((v * 100))"
+    done
+    # NVIDIA GPU (if nvidia-smi is present)
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        v=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+        if [[ ${v:-} =~ ^[0-9]+$ ]] && ((v > 0)); then
+            printf 'gpu|nvidia-smi|%s\n' "$((v * 1000))"
+        fi
+    fi
+    # ThinkPad EC: /proc/acpi/ibm/thermal  ("temperatures: 45 42 0 ... -128")
+    if [ -r "$TP_THERMAL" ]; then
+        vals=$(sed -n 's/^temperatures:[[:space:]]*//p' "$TP_THERMAL" 2>/dev/null)
+        i=0
+        for v in $vals; do
+            if [[ $v =~ ^[0-9]+$ ]] && ((v > 0 && v < 120)); then
+                printf 'ec|thinkpad-ec idx%s|%s\n' "$i" "$((v * 1000))"
+            fi
+            i=$((i + 1))
+        done
+    fi
+    # Simulated values (tests only): THINKFAN_FAKE="cpu=95,gpu=97" or THINKFAN_FAKE_FILE=/tmp/fake
+    [ -n "${FAKE_FILE:-}" ] && [ -r "$FAKE_FILE" ] && FAKE=$(cat "$FAKE_FILE" 2>/dev/null)
+    if [ -n "$FAKE" ]; then
+        local pair
+        for pair in ${FAKE//,/ }; do
+            [ "${pair}" = "-" ] && continue
+            printf '%s|simulated %s|%s\n' "${pair%%=*}" "${pair%%=*}" "$((${pair##*=} * 1000))"
+        done
+    fi
+}
+
+role_warn() {
+    case "$1" in
+    cpu) echo "$WARN_CPU" ;; gpu) echo "$WARN_GPU" ;; nvme) echo "$WARN_NVME" ;;
+    bat) echo "$WARN_BAT" ;; acpi) echo "$WARN_ACPI" ;; ec) echo "$WARN_EC" ;;
+    *) echo "$WARN_OTHER" ;;
+    esac
+}
+role_crit() {
+    case "$1" in
+    cpu) echo "$CRIT_CPU" ;; gpu) echo "$CRIT_GPU" ;; nvme) echo "$CRIT_NVME" ;;
+    bat) echo "$CRIT_BAT" ;; acpi) echo "$CRIT_ACPI" ;; ec) echo "$CRIT_EC" ;;
+    *) echo "$CRIT_OTHER" ;;
+    esac
+}
+role_in_decisions() {
+    [ "$1" = ec ] && [ "$EC_IN_DECISIONS" != 1 ] && return 1
+    return 0
+}
+
+SEV=0; SEV_ROLE=""; SEV_TEMP=""; SEV_NAME=""
+evaluate() { # sets SEV 0/1/2, SEV_ROLE, SEV_TEMP, SEV_NAME, SEV_SENSORS
+    local role name milli t w c s worst=0 wrole="" wtemp=0 wname="" count=0
+    while IFS='|' read -r role name milli; do
+        [ -n "$role" ] || continue
+        t=$((milli / 1000))
+        count=$((count + 1))
+        role_in_decisions "$role" || continue
+        w=$(role_warn "$role"); c=$(role_crit "$role")
+        if ((t >= c)); then s=2; elif ((t >= w)); then s=1; else s=0; fi
+        if ((s > worst)); then worst=$s; wrole=$role; wtemp=$t; wname=$name; fi
+    done < <(sensor_lines)
+    SEV=$worst; SEV_ROLE=$wrole; SEV_TEMP=$wtemp; SEV_NAME=$wname; SEV_SENSORS=$count
+}
+
+max_of_role() { # $1 = role -> highest °C
+    local role name milli t m=0
+    while IFS='|' read -r role name milli; do
+        [ "$role" = "$1" ] || continue
+        t=$((milli / 1000))
+        ((t > m)) && m=$t
+    done < <(sensor_lines)
+    echo "$m"
+}
+
+sev_label() {
+    case "$1" in
+    2) printf 'CRITICAL' ;; 1) printf 'warm' ;; *) printf 'normal' ;;
+    esac
+}
+sev_color() {
+    case "$1" in
+    2) printf '%s' "$c_red" ;; 1) printf '%s' "$c_yel" ;; *) printf '%s' "$c_grn" ;;
+    esac
+}
+
+# ------------------------------------------------------- CPU measures --------
+cpu_policies() {
+    local d
+    for d in "$SYS_CPU"/cpufreq/policy*; do [ -d "$d" ] && printf '%s\n' "$d"; done
+}
+cpuinfo_max() {
+    local d m=0 v
+    for d in $(cpu_policies); do
+        [ -r "$d/cpuinfo_max_freq" ] || continue
+        v=$(cat "$d/cpuinfo_max_freq")
+        ((v > m)) && m=$v
+    done
+    echo "$m"
+}
+cap_cpu() { # $1 = percent (0 = reset)
+    local pct=$1 max khz
+    max=$(cpuinfo_max)
+    if [ "${max:-0}" -le 0 ]; then
+        log INFO "no cpufreq interface (VM/container?), CPU cap skipped"
+        return 1
+    fi
+    if [ "$pct" -le 0 ]; then
+        _priv cpu-max reset && log INFO "CPU clock released again" && return 0
+        return 1
+    fi
+    khz=$((max * pct / 100))
+    if _priv cpu-max "$khz"; then
+        log INFO "CPU clock capped at $((pct))% ($((khz / 1000)) MHz)"
+        return 0
+    fi
+    return 1
+}
+set_boost() { # 1 = on, 0 = off, reset = default
+    local want=$1
+    [ -e "$SYS_CPU/cpufreq/boost" ] || [ -e "$SYS_CPU/intel_pstate/no_turbo" ] || return 1
+    _priv boost "$want"
+}
+
+# --------------------------------------------------- process measures --------
+offenders() { # $1 = minimum CPU%
+    local min=${1:-$RENICE_MIN_CPU} pid comm cpu
+    ps -eo pid=,comm=,%cpu= --sort=-%cpu 2>/dev/null |
+        while read -r pid comm cpu; do
+            [ -n "${pid:-}" ] || continue
+            [[ $pid =~ ^[0-9]+$ ]] || continue
+            [ "$pid" -gt 1 ] || continue
+            [ -d "/proc/$pid" ] || continue
+            case "$comm" in \[*\]) continue ;; esac
+            awk -v c="$cpu" -v m="$min" 'BEGIN{exit !(c+0 >= m+0)}' || continue
+            [[ $comm =~ $PROC_WHITELIST ]] && continue
+            printf '%s|%s|%s\n' "$pid" "$comm" "$cpu"
+        done
+}
+
+renice_offenders() {
+    local pid comm cpu nice0
+    while IFS='|' read -r pid comm cpu; do
+        [ -n "${pid:-}" ] || continue
+        [ "$DRY_RUN" = 1 ] && { log INFO "DRY-RUN: would renice PID $pid ($comm, ${cpu}% CPU) -> nice $RENICE_NICE"; continue; }
+        grep -q "^$pid|" "$RENICE_FILE" 2>/dev/null && continue
+        nice0=$(awk '{print $19}' "/proc/$pid/stat" 2>/dev/null) || nice0=0
+        if _priv renice "$pid" "$RENICE_NICE"; then
+            printf '%s|%s|%s\n' "$pid" "$nice0" "$comm" >>"$RENICE_FILE"
+            log WARN "CPU hog slowed down: PID $pid ($comm, ${cpu}% CPU) -> nice $RENICE_NICE"
+        fi
+    done < <(offenders "$RENICE_MIN_CPU")
+}
+
+unrenice_all() {
+    local pid nice0 comm
+    [ "$DRY_RUN" = 1 ] && return 0
+    [ -r "$RENICE_FILE" ] || return 0
+    while IFS='|' read -r pid nice0 comm; do
+        [ -n "${pid:-}" ] || continue
+        [ -d "/proc/$pid" ] || continue
+        _priv renice "$pid" "${nice0:-0}" >/dev/null 2>&1 &&
+            log INFO "nice of PID $pid ($comm) reset to ${nice0:-0}"
+    done <"$RENICE_FILE"
+    : >"$RENICE_FILE" 2>/dev/null || true
+}
+
+kill_offenders() {
+    local pid comm cpu
+    while IFS='|' read -r pid comm cpu; do
+        [ -n "${pid:-}" ] || continue
+        if _priv term "$pid"; then
+            log CRIT "SIGTERM to PID $pid ($comm, ${cpu}% CPU), persistently too hot"
+        fi
+    done < <(offenders "$KILL_MIN_CPU")
+}
+
+# -------------------------------------------------------- notifications ------
+notify() { # $1 = level (0/1/2), $2 = message
+    local sev=$1 m=$2
+    if [ -n "$NOTIFY_CMD" ]; then
+        local -a nc
+        read -r -a nc <<<"$NOTIFY_CMD"
+        if [ "$DRY_RUN" = 1 ]; then
+            log INFO "DRY-RUN: would notify: $NOTIFY_CMD (level $sev, $m)"
+        else
+            "${nc[@]}" "$sev" "$m" >/dev/null 2>&1 &
+        fi
+    fi
+    if [ "$NOTIFY_DESKTOP" = 1 ] && command -v notify-send >/dev/null 2>&1 &&
+        { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
+        notify-send -u critical "thinkfan: $(sev_label "$sev")" "$m" >/dev/null 2>&1 &
+    fi
+}
+
+write_state() { # $1 = level
+    local sev=$1 tmp
+    tmp=$(mktemp 2>/dev/null) || return 0
+    cat >"$tmp" <<EOF
+{
+  "time": "$(now_iso)",
+  "severity": $sev,
+  "severity_label": "$(sev_label "$sev")",
+  "pid": $$,
+  "poll_s": $POLL,
+  "role": "${SEV_ROLE:-}",
+  "sensor": "${SEV_NAME:-}",
+  "temp_c": ${SEV_TEMP:-0},
+  "temps_c": {"cpu": $(max_of_role cpu), "gpu": $(max_of_role gpu), "nvme": $(max_of_role nvme), "bat": $(max_of_role bat), "acpi": $(max_of_role acpi), "ec": $(max_of_role ec)},
+  "fan": {"available": $(fan_available && echo true || echo false), "level": "$(fan_field level)", "speed_rpm": "$(fan_field speed)", "status": "$(fan_field status)"}
+}
+EOF
+    mv "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+# ------------------------------------------------------- countermeasures -----
+CAPTURED=0
+capture_baseline() {
+    CAPTURED=1
+}
+
+cleanup_cpu() {
+    local d
+    for d in $(cpu_policies); do
+        [ -w "$d/scaling_max_freq" ] && [ -r "$d/cpuinfo_max_freq" ] || continue
+        [ "$(cat "$d/scaling_max_freq")" = "$(cat "$d/cpuinfo_max_freq")" ] || _priv cpu-max reset >/dev/null 2>&1
+    done
+    if [ "$CPU_BOOST_CRIT" = 1 ]; then set_boost reset >/dev/null 2>&1; fi
+}
+
+apply_level() { # $1 = target level 0|1|2
+    local lvl=$1 role=${SEV_ROLE:-} t=${SEV_TEMP:-0}
+
+    case "$lvl" in
+    0)
+        log INFO "everything back in the green, rolling back countermeasures"
+        if [ "$FAN_RESTORE_ON_EXIT" = 1 ]; then set_fan auto; fi
+        cap_cpu 0
+        cleanup_cpu
+        unrenice_all
+        ;;
+    1)
+        set_fan "$FAN_LEVEL_WARN"
+        cap_cpu "$CPU_CAP_PCT_WARN"
+        unrenice_all
+        ;;
+    2)
+        if [ "$FAN_DISENGAGE_ON_CRIT" = 1 ]; then set_fan disengaged; else set_fan "$FAN_LEVEL_CRIT"; fi
+        cap_cpu "$CPU_CAP_PCT_CRIT"
+        [ "$CPU_BOOST_CRIT" = 1 ] && set_boost 0
+        [ -n "$CPU_GOVERNOR_CRIT" ] && _priv governor "$CPU_GOVERNOR_CRIT"
+        [ "$RENICE_ENABLED" = 1 ] && renice_offenders
+        ;;
+    esac
+    write_state "$lvl"
+    notify "$lvl" "thinkfan: $(sev_label "$lvl"), ${role:-?} ${t}°C (${SEV_NAME:-}), level $lvl active"
+}
+
+limit_for_level() { # lowest allowed limit for the rollback
+    local lvl=$1 roles="cpu gpu nvme bat acpi other" r v min=999
+    [ "$EC_IN_DECISIONS" = 1 ] && roles="$roles ec"
+    for r in $roles; do
+        if [ "$lvl" -ge 2 ]; then v=$(( $(role_crit "$r") - HYSTERESIS )); else v=$(( $(role_warn "$r") - HYSTERESIS )); fi
+        ((v < min)) && min=$v
+    done
+    echo "$min"
+}
+
+all_below() { # $1 = current level; true if EVERY role is below its own threshold minus hysteresis
+    local lvl=$1 role name milli t lim
+    while IFS='|' read -r role name milli; do
+        role_in_decisions "$role" || continue
+        t=$((milli / 1000))
+        if [ "$lvl" -ge 2 ]; then lim=$(( $(role_crit "$role") - HYSTERESIS )); else lim=$(( $(role_warn "$role") - HYSTERESIS )); fi
+        ((t >= lim)) && return 1
+    done < <(sensor_lines)
+    return 0
+}
+
+# ---------------------------------------------------------------- guard -----
+guard_cleanup() {
+    log INFO "guard stopped, cleaning up"
+    if [ "$FAN_RESTORE_ON_EXIT" = 1 ] && fan_available; then
+        set_fan auto >/dev/null 2>&1
+    fi
+    cleanup_cpu
+    unrenice_all
+    rm -f "$STATE_FILE" 2>/dev/null || true
+}
+
+run_guard() {
+    local once=$1 cur=0 below=0 last_esc=0 crit_hits=0 sev loglevel=INFO
+    trap 'guard_cleanup; exit 0' INT TERM HUP
+    guard_cleanup_quiet
+    capture_baseline
+    log INFO "guard started (PID $$, poll ${POLL}s, log $LOG_FILE)"
+    write_state 0
+    while :; do
+        evaluate
+        sev=$SEV
+        if ((sev >= 2)); then crit_hits=$((crit_hits + 1)); else crit_hits=0; fi
+        if ((sev > cur)); then
+            if ((cur == 0 || $(now_epoch) - last_esc >= MIN_ESCALATE_INTERVAL)); then
+                cur=$sev; last_esc=$(now_epoch); below=0
+                case "$sev" in
+                2) loglevel=CRIT ;;
+                1) loglevel=WARN ;;
+                *) loglevel=INFO ;;
+                esac
+                log "$loglevel" "$(sev_label "$sev"), ${SEV_ROLE:-?} ${SEV_TEMP}°C (${SEV_NAME:-}) -> level $sev"
+                apply_level "$cur"
+                if [ "$KILL_ENABLED" = 1 ] && [ "$sev" -ge 2 ] && [ "$crit_hits" -ge "$KILL_AFTER_SAMPLES" ]; then
+                    log CRIT "critical temperature has held for $crit_hits measurements, stepping in"
+                    kill_offenders
+                fi
+            fi
+        elif ((sev < cur)); then
+            if all_below "$cur"; then
+                below=$((below + 1))
+                if [ "$below" -ge "$RECOVER_SAMPLES" ]; then
+                    cur=$((cur - 1)); below=0
+                    log INFO "cooldown confirmed ($RECOVER_SAMPLES measurements below the thresholds) -> level $cur"
+                    apply_level "$cur"
+                    crit_hits=0
+                fi
+            else
+                below=0
+            fi
+        else
+            below=0
+            write_state "$cur"
+        fi
+        if [ "$once" = 1 ]; then return "$sev"; fi
+        sleep "$POLL"
+    done
+}
+
+guard_cleanup_quiet() { # roll back leftovers from a hard abort
+    local d
+    for d in $(cpu_policies); do
+        [ -r "$d/scaling_max_freq" ] && [ -r "$d/cpuinfo_max_freq" ] || continue
+        if [ "$(cat "$d/scaling_max_freq")" != "$(cat "$d/cpuinfo_max_freq")" ]; then
+            log INFO "found an old CPU cap, resetting it"
+            cleanup_cpu
+            break
+        fi
+    done
+    [ -s "${RENICE_FILE:-/nonexistent}" ] && unrenice_all
+}
+
+# ----------------------------------------------------------------- output ---
+print_status() {
+    local role name milli t w c col mark line sev_rows=0
+    printf '%s=== thinkfan %s ===%s\n' "$c_bold" "$VERSION" "$c_reset"
+    printf 'Host: %s   Time: %s\n' "$(uname -n)" "$(now_iso)"
+    if fan_available; then
+        printf 'Fan: level=%s%s%s  speed=%s RPM  status=%s\n' \
+            "$c_bold" "$(fan_field level)" "$c_reset" "$(fan_field speed)" "$(fan_field status)"
+        fan_write_possible || printf '%s(control locked: fan_control=1 missing, modprobe.d/thinkpad_acpi.conf)%s\n' "$c_dim" "$c_reset"
+    else
+        printf '%sFan: no ThinkPad interface (%s)%s\n' "$c_dim" "$FAN_PROC" "$c_reset"
+    fi
+    printf '\n%-8s %-34s %8s  %s\n' "ROLE" "SENSOR" "TEMP" "STATUS"
+    while IFS='|' read -r role name milli; do
+        t=$((milli / 1000))
+        w=$(role_warn "$role"); c=$(role_crit "$role")
+        if ((t >= c)); then mark="critical"; col=$c_red
+        elif ((t >= w)); then mark="warm"; col=$c_yel
+        else mark="ok"; col=$c_grn; fi
+        if [ "$role" != ec ] || [ "$EC_IN_DECISIONS" = 1 ]; then :; else mark="$mark (display only)"; fi
+        printf '%-8s %-34s %6s°C  %s%s%s\n' "$role" "$name" "$t" "$col" "$mark" "$c_reset"
+        sev_rows=$((sev_rows + 1))
+    done < <(sensor_lines)
+    [ "$sev_rows" -eq 0 ] && printf '%s(no temperature sensors found)%s\n' "$c_dim" "$c_reset"
+    evaluate
+    printf '\nOverall: %s%s%s' "$(sev_color "$SEV")" "$(sev_label "$SEV")" "$c_reset"
+    if [ "$SEV" -gt 0 ]; then printf '  (trigger: %s %s°C)' "$SEV_ROLE" "$SEV_TEMP"; fi
+    printf '\n'
+    if [ -r "$STATE_FILE" ]; then
+        printf '%sGuard status: %s%s\n' "$c_dim" "$(grep -m1 '"time"' "$STATE_FILE" | tr -d ' ",' | cut -d: -f2-)" "$c_reset"
+    fi
+    if systemctl is-active --quiet thinkfan-guard 2>/dev/null; then
+        printf '%sGuard: systemd service thinkfan-guard is running%s\n' "$c_dim" "$c_reset"
+    fi
+}
+
+print_check() { # one measurement, exit 0/1/2
+    local json=$1
+    evaluate
+    write_state "$SEV"
+    if [ "$json" = 1 ]; then
+        cat "$STATE_FILE"
+    else
+        printf 'thinkfan: %s' "$(sev_label "$SEV")"
+        [ "$SEV" -gt 0 ] && printf ': %s %s°C (%s)' "$SEV_ROLE" "$SEV_TEMP" "$SEV_NAME"
+        local part="" v list=""
+        for part in cpu gpu nvme bat; do
+            v=$(max_of_role "$part")
+            [ "${v:-0}" -gt 0 ] && list="${list}${part^^} ${v}°C, "
+        done
+        printf '  [%s]' "${list%, }"
+        fan_available && printf '  fan %s RPM (%s)' "$(fan_field speed)" "$(fan_field level)"
+        printf '\n'
+    fi
+    return "$SEV"
+}
+
+print_probe() {
+    printf '=== thinkfan %s, capabilities of this system ===\n' "$VERSION"
+    printf 'Host: %s\n' "$(uname -n)"
+    printf 'Fan interface %s: %s\n' "$FAN_PROC" "$(fan_available && echo present || echo MISSING)"
+    [ -r "$FAN_PROC" ] && sed 's/^/    /' "$FAN_PROC"
+    printf 'ThinkPad EC %s: %s\n' "$TP_THERMAL" "$([ -r "$TP_THERMAL" ] && echo present || echo 'missing (no ThinkPad?)')"
+    [ -r "$TP_THERMAL" ] && sed 's/^/    /' "$TP_THERMAL"
+    printf 'Root helper %s: %s\n' "$HELPER" "$([ -x "$HELPER" ] && echo installed || echo MISSING)"
+    printf 'NVIDIA-SMI: %s\n' "$(command -v nvidia-smi || echo 'not present')"
+    printf 'cpufreq: %s\n' "$(cpu_policies | tr '\n' ' ')"
+    printf '  cpuinfo_max_freq: %s kHz\n' "$(cpuinfo_max)"
+    printf '  Boost interface: %s\n' "$([ -e "$SYS_CPU/cpufreq/boost" ] && echo "$SYS_CPU/cpufreq/boost" || { [ -e "$SYS_CPU/intel_pstate/no_turbo" ] && echo "$SYS_CPU/intel_pstate/no_turbo" || echo none; })"
+    printf 'Configuration: %s%s\n' "$SYS_CONF" "$([ -r "$SYS_CONF" ] || echo ' (not present)')"
+    printf '               %s%s\n' "$USR_CONF" "$([ -r "$USR_CONF" ] || echo ' (not present)')"
+    printf 'Log/state: %s\n' "$STATE_DIR"
+    printf '\nDetected temperature sensors (role | name | value):\n'
+    sensor_lines | while IFS='|' read -r role name milli; do
+        printf '  %-6s %-36s %6s°C\n' "$role" "$name" "$((milli / 1000))"
+    done
+}
+
+# ------------------------------------------------------------------- help ---
+show_help() {
+    cat <<EOF
+NAME
+    $PROG - ThinkPad fan, temperature monitoring and guard
+
+SYNOPSIS
+    $PROG [OPTION]
+
+FAN
+    -a, --auto              automatic (BIOS/EC), default after heavy tasks
+    -f, --full              full speed (disengaged), maximum cooling
+    -l, --level <1-7>       fixed fan level
+
+MONITORING
+    -s, --status            snapshot: fan and all temperatures
+    -w, --watch [SEC]       live view (default: every 3 s)
+    -c, --check [--json]    one measurement, exit code 0=ok / 1=warm / 2=critical
+                            (ideal for cron or Telegram messages)
+        --probe             shows detected sensors and interfaces
+
+GUARD (countermeasures)
+    -g, --guard             long running guard: raises the fan, caps the CPU
+                            clock, disables turbo, slows CPU hogs and rolls
+                            everything back once it cools down
+        --once              a single evaluation and intervention, then exit
+    -n, --dry-run           write nothing, only show what would happen
+
+OTHER
+        --log [N]           last N log lines (default 30)
+        --show-config       print the effective settings
+        --version           version
+    -h, --help              this help
+
+ENVIRONMENT
+    THINKFAN_FAKE="cpu=95,gpu=97"     inject test sensors (testing only)
+    THINKFAN_FAKE_FILE=<path>         read test sensors from a file (changes live)
+    THINKFAN_ROOT_HELPER=<path>       use a different root helper than $HELPER
+    NO_COLOR=1                      no colors
+
+FILES
+    $SYS_CONF        thresholds and actions (system)
+    $USR_CONF    user overrides
+    $STATE_DIR/thinkfan.log              log
+    /usr/local/sbin/thinkfan-root        root helper (NOPASSWD in /etc/sudoers.d/thinkfan)
+
+EXIT CODES
+    0 normal | 1 warm | 2 critical | 3 error | 64 bad arguments
+EOF
+}
+
+show_config() {
+    printf 'POLL=%s  HYSTERESIS=%s  RECOVER_SAMPLES=%s  MIN_ESCALATE_INTERVAL=%s\n' \
+        "$POLL" "$HYSTERESIS" "$RECOVER_SAMPLES" "$MIN_ESCALATE_INTERVAL"
+    printf 'Thresholds warn/crit: cpu %s/%s  gpu %s/%s  nvme %s/%s  bat %s/%s  acpi %s/%s  ec %s/%s  other %s/%s\n' \
+        "$WARN_CPU" "$CRIT_CPU" "$WARN_GPU" "$CRIT_GPU" "$WARN_NVME" "$CRIT_NVME" "$WARN_BAT" "$CRIT_BAT" \
+        "$WARN_ACPI" "$CRIT_ACPI" "$WARN_EC" "$CRIT_EC" "$WARN_OTHER" "$CRIT_OTHER"
+    printf 'Fan: warn=%s crit=%s disengage_on_crit=%s restore_on_exit=%s\n' \
+        "$FAN_LEVEL_WARN" "$FAN_LEVEL_CRIT" "$FAN_DISENGAGE_ON_CRIT" "$FAN_RESTORE_ON_EXIT"
+    printf 'CPU: cap warn=%s%% crit=%s%% boost_off_crit=%s governor_crit=%s\n' \
+        "$CPU_CAP_PCT_WARN" "$CPU_CAP_PCT_CRIT" "$CPU_BOOST_CRIT" "${CPU_GOVERNOR_CRIT:-none}"
+    printf 'Processes: renice=%s (from %s%%, nice %s)  kill=%s (from %s%%, after %s measurements)\n' \
+        "$RENICE_ENABLED" "$RENICE_MIN_CPU" "$RENICE_NICE" "$KILL_ENABLED" "$KILL_MIN_CPU" "$KILL_AFTER_SAMPLES"
+    printf 'Notification: NOTIFY_CMD=%s  desktop=%s\n' "${NOTIFY_CMD:-none}" "$NOTIFY_DESKTOP"
+}
+
+show_log() {
+    local n=${1:-30}
+    [ -r "$LOG_FILE" ] || { msg "no log at $LOG_FILE"; return 3; }
+    tail -n "$n" "$LOG_FILE"
+}
+
+# ------------------------------------------------------------------- main ---
+main() {
+    local action="" lvl="" watch_interval=3 json=0 once=0 logn=30
+    [ -n "${THINKFAN_FAKE:-}" ] && FAKE=$THINKFAN_FAKE
+    FAKE_FILE=${THINKFAN_FAKE_FILE:-}
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        -a | --auto) action=fan; lvl=auto ;;
+        -f | --full) action=fan; lvl=disengaged ;;
+        -l | --level)
+            lvl=${2:-}
+            [[ ${lvl:-} =~ ^[1-7]$ ]] || { msg "$PROG: level 1-7 expected (e.g. -l 5)"; exit 64; }
+            action=fan
+            shift
+            ;;
+        -s | --status) action=status ;;
+        -w | --watch)
+            action=watch
+            if [[ ${2:-} =~ ^[0-9]+$ ]]; then watch_interval=$2; shift; fi
+            ;;
+        -c | --check) action=check ;;
+        -g | --guard) action=guard ;;
+        --once) once=1 ;;
+        -n | --dry-run) DRY_RUN=1 ;;
+        -j | --json) json=1 ;;
+        --probe) action=probe ;;
+        --log)
+            action=log
+            [[ ${2:-} =~ ^[0-9]+$ ]] && { logn=$2; shift; }
+            ;;
+        --show-config) action=config ;;
+        --version | -V) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        -h | --help) show_help; exit 0 ;;
+        *)
+            msg "$PROG: unknown option '$1' (see --help)"
+            exit 64
+            ;;
+        esac
+        shift
+    done
+
+    setup_colors
+    load_config
+    resolve_state_dir
+
+    case "$action" in
+    "")
+        show_help
+        exit 0
+        ;;
+    fan)
+        if ! fan_available && [ "$DRY_RUN" != 1 ]; then
+            msg "$PROG: $FAN_PROC does not exist, no ThinkPad with thinkpad_acpi (fan_control=1)."
+            msg "      Hint: /etc/modprobe.d/thinkpad_acpi.conf with 'options thinkpad_acpi fan_control=1' plus reboot."
+            exit 3
+        fi
+        set_fan "$lvl" || exit 3
+        fan_available && printf 'Fan now: level=%s speed=%s RPM\n' "$(fan_field level)" "$(fan_field speed)"
+        ;;
+    status) print_status ;;
+    watch)
+        while :; do
+            clear 2>/dev/null || printf '\033[H\033[2J'
+            print_status
+            printf '%s(Ctrl-C to quit, interval %ss)%s\n' "$c_dim" "$watch_interval" "$c_reset"
+            sleep "$watch_interval"
+        done
+        ;;
+    check)
+        if [ "$json" = 1 ]; then print_check 1; else print_check 0; fi
+        exit "$SEV"
+        ;;
+    probe) print_probe ;;
+    config) show_config ;;
+    log) show_log "$logn" || exit 3 ;;
+    guard)
+        if [ "$once" = 1 ]; then
+            run_guard 1
+            rc=$?
+            printf 'thinkfan: single guard run -> %s (exit %s)\n' "$(sev_label "$rc")" "$rc"
+            exit "$rc"
+        fi
+        run_guard 0
+        ;;
+    esac
+    exit 0
+}
+
+main "$@"

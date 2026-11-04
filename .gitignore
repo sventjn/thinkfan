@@ -1,0 +1,14 @@
+# Build artifacts do not belong in the repo
+*.tar.gz
+*.zip
+
+# Runtime data
+state.json
+thinkfan.log
+reniced
+cpu-max.orig
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*~

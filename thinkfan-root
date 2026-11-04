@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  thinkfan-root 1.0.0: tightly scoped root helper for thinkfan
+# ============================================================================
+#  Called by the user script through  sudo -n  and allowed in
+#  /etc/sudoers.d/thinkfan with NOPASSWD.
+#
+#  SECURITY: This helper is the ONLY path thinkfan uses without a password.
+#  It accepts nothing but the commands defined below, each with strictly
+#  validated arguments: no shell invocation, no generic "write <path> <value>",
+#  no wildcards. Anyone extending this must add a new explicit command and
+#  take care of path allowlists.
+#
+#  Usage (every command validates first, only then asks for root, so the
+#  argument checks are testable without root):
+#     thinkfan-root fan <auto|full|disengaged|1..7>
+#     thinkfan-root cpu-max <khz|reset>
+#     thinkfan-root boost <0|1|reset>
+#     thinkfan-root governor <governor>|auto
+#     thinkfan-root renice <pid> <nice>
+#     thinkfan-root term <pid>
+#     thinkfan-root selftest
+# ============================================================================
+set -uo pipefail
+
+FAN_PROC=${FAN_PROC:-/proc/acpi/ibm/fan}
+SYS_CPU=${SYS_CPU:-/sys/devices/system/cpu}
+
+usage() {
+    cat >&2 <<'EOF'
+thinkfan-root, root helper for thinkfan (only these commands are allowed):
+
+  fan <auto|full|disengaged|1..7>   set fan mode/level (thinkpad_acpi)
+  cpu-max <khz|reset>               cap scaling_max_freq on all CPU policies
+  boost <0|1|reset>                 switch CPU boost (turbo) on/off
+  governor <name|auto>              set the cpufreq governor
+  renice <pid> <nice>               change the priority of a process
+  term <pid>                        send SIGTERM to a process
+  selftest                          only checks whether NOPASSWD works
+EOF
+    exit 64
+}
+
+die() { printf 'thinkfan-root: %s\n' "$*" >&2; exit 1; }
+
+# Every command takes exactly its arguments. Anything beyond that is an error.
+no_extra() { [ "$#" -eq 0 ] || die "unexpected extra arguments: $*"; }
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] || die "must run as root (sudo thinkfan-root ...)"
+}
+
+# --- CPU policy paths ------------------------------------------------------
+cpu_policy_dirs() {
+    local d
+    for d in "$SYS_CPU"/cpufreq/policy*; do
+        [ -d "$d" ] || continue
+        printf '%s\n' "$d"
+    done
+}
+
+cmd=${1:-}
+[ -n "$cmd" ] || usage
+shift || true
+
+case "$cmd" in
+# ------------------------------------------------------------------- fan ----
+fan)
+    arg=${1:-}; shift || true
+    no_extra "$@"
+    case "$arg" in
+    auto | full | disengaged | [1-7]) ;;
+    *) die "invalid fan mode: '$arg' (auto|full|disengaged|1-7)" ;;
+    esac
+    need_root
+    [ -e "$FAN_PROC" ] || die "$FAN_PROC does not exist. Is thinkpad_acpi loaded with fan_control=1?"
+    [ -w "$FAN_PROC" ] || die "$FAN_PROC is not writable"
+    printf 'level %s\n' "$arg" >"$FAN_PROC" || die "writing to $FAN_PROC failed"
+    printf 'fan: level %s set\n' "$arg"
+    ;;
+
+# --------------------------------------------------------------- CPU clock --
+cpu-max)
+    arg=${1:-}; shift || true
+    no_extra "$@"
+    case "$arg" in
+    reset) ;;
+    '' | *[!0-9]*) die "invalid value: '$arg' (kHz number or 'reset')" ;;
+    esac
+    dirs=$(cpu_policy_dirs)
+    [ -n "$dirs" ] || die "no cpufreq policies found (container/VM or cpufreq not active)"
+    need_root
+    rc=0
+    for d in $dirs; do
+        if [ "$arg" = reset ]; then
+            [ -r "$d/cpuinfo_max_freq" ] || continue
+            val=$(cat "$d/cpuinfo_max_freq")
+        else
+            val=$arg
+            # never above the hardware maximum
+            if [ -r "$d/cpuinfo_max_freq" ] && [ "$arg" -gt "$(cat "$d/cpuinfo_max_freq")" ]; then
+                val=$(cat "$d/cpuinfo_max_freq")
+            fi
+            # never below the hardware minimum
+            if [ -r "$d/cpuinfo_min_freq" ] && [ "$val" -lt "$(cat "$d/cpuinfo_min_freq")" ]; then
+                val=$(cat "$d/cpuinfo_min_freq")
+            fi
+        fi
+        if [ -w "$d/scaling_max_freq" ]; then
+            printf '%s\n' "$val" >"$d/scaling_max_freq" || rc=1
+        fi
+    done
+    [ "$rc" -eq 0 ] || die "setting scaling_max_freq failed"
+    if [ "$arg" = reset ]; then printf 'cpu-max: reset to hardware maximum\n'
+    else printf 'cpu-max: set to %s kHz\n' "$arg"; fi
+    ;;
+
+# --------------------------------------------------------------- CPU boost --
+boost)
+    arg=${1:-}; shift || true
+    no_extra "$@"
+    case "$arg" in 0 | 1 | reset) ;; *) die "invalid value: '$arg' (0|1|reset)" ;; esac
+    need_root
+    found=0
+    for p in "$SYS_CPU"/cpufreq/boost "$SYS_CPU"/intel_pstate/no_turbo; do
+        [ -e "$p" ] || continue
+        found=1
+        if [ "$arg" = reset ]; then
+            case "$p" in */no_turbo) printf '0\n' >"$p" || die "writing to $p failed" ;;
+            *) printf '1\n' >"$p" || die "writing to $p failed" ;;
+            esac
+        else
+            case "$p" in */no_turbo) printf '%s\n' "$((arg == 0 ? 1 : 0))" >"$p" || die "writing to $p failed" ;;
+            *) printf '%s\n' "$arg" >"$p" || die "writing to $p failed" ;;
+            esac
+        fi
+    done
+    [ "$found" -eq 1 ] || die "no boost interface found (amd_pstate/cpufreq/boost missing)"
+    printf 'boost: %s set\n' "$arg"
+    ;;
+
+# ---------------------------------------------------------------- governor --
+governor)
+    arg=${1:-}; shift || true
+    no_extra "$@"
+    [ -n "$arg" ] || die "governor missing"
+    dirs=$(cpu_policy_dirs)
+    [ -n "$dirs" ] || die "no cpufreq policies found"
+    avail=""
+    for d in $dirs; do
+        [ -r "$d/scaling_available_governors" ] || continue
+        avail=$(cat "$d/scaling_available_governors")
+        break
+    done
+    [ -n "$avail" ] || die "scaling_available_governors not readable"
+    if [ "$arg" = auto ]; then
+        for g in powersave schedutil ondemand conservative; do
+            case " $avail " in *" $g "*) tgt=$g; break ;; esac
+        done
+    else
+        case " $avail " in *" $arg "*) tgt=$arg ;; *) die "governor '$arg' not available (possible: $avail)" ;; esac
+    fi
+    [ -n "${tgt:-}" ] || die "no automatic governor found (available: $avail)"
+    need_root
+    for d in $dirs; do
+        [ -w "$d/scaling_governor" ] && printf '%s\n' "$tgt" >"$d/scaling_governor"
+    done
+    printf 'governor: %s set\n' "$tgt"
+    ;;
+
+# ------------------------------------------------------------------ renice --
+renice)
+    pid=${1:-} nice=${2:-}
+    [ "$#" -le 2 ] || die "unexpected extra arguments: ${*:3}"
+    case "$pid" in '' | *[!0-9]*) die "invalid PID: '$pid'" ;; esac
+    case "$nice" in -[0-9] | -[0-9][0-9] | [0-9] | [0-9][0-9]) ;; *) die "invalid nice value: '$nice'" ;; esac
+    [ "$pid" -gt 1 ] || die "PID 0/1 is never touched"
+    [ "$nice" -ge -20 ] && [ "$nice" -le 19 ] || die "nice value outside -20..19"
+    [ -d "/proc/$pid" ] || die "PID $pid does not exist"
+    need_root
+    renice -n "$nice" -p "$pid" >/dev/null || die "renice for PID $pid failed"
+    printf 'renice: PID %s -> nice %s\n' "$pid" "$nice"
+    ;;
+
+# -------------------------------------------------------------------- term --
+term)
+    pid=${1:-}; shift || true
+    no_extra "$@"
+    case "$pid" in '' | *[!0-9]*) die "invalid PID: '$pid'" ;; esac
+    [ "$pid" -gt 1 ] || die "PID 0/1 is never touched"
+    [ -d "/proc/$pid" ] || die "PID $pid does not exist"
+    need_root
+    kill -TERM "$pid" || die "SIGTERM to PID $pid failed"
+    printf 'term: SIGTERM to PID %s\n' "$pid"
+    ;;
+
+# ---------------------------------------------------------------- selftest --
+selftest)
+    need_root
+    printf 'thinkfan-root: ok, running as uid 0 (NOPASSWD works)\n'
+    ;;
+
+-h | --help | help) usage ;;
+*) die "unknown command: '$cmd' (see --help)" ;;
+esac
+
+exit 0
